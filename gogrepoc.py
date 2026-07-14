@@ -23,6 +23,7 @@ import threading
 import logging
 import html5lib
 import pprint
+import json
 import time
 import zipfile
 import hashlib
@@ -69,13 +70,13 @@ if sys.version_info[0] < 3:
 # python 2 / 3 imports
 try:
     # python 2
-    from Queue import Queue
+    from Queue import Queue, Empty
     from urlparse import urlparse,unquote,urlunparse,parse_qs
     from itertools import izip_longest as zip_longest
     from StringIO import StringIO
 except ImportError:
     # python 3
-    from queue import Queue
+    from queue import Queue, Empty
     from urllib.parse import urlparse, unquote, urlunparse,parse_qs
     from itertools import zip_longest
     from io import StringIO
@@ -136,8 +137,10 @@ log_exception = rootLogger.exception
 # filepath constants
 GAME_STORAGE_DIR = r'.'
 TOKEN_FILENAME = r'gog-token.dat'
-MANIFEST_FILENAME = r'gog-manifest.dat'
-RESUME_MANIFEST_FILENAME = r'gog-resume-manifest.dat'
+MANIFEST_FILENAME = r'gog-manifest.dat'  # legacy eval()-based format; kept only as a one-time migration source
+RESUME_MANIFEST_FILENAME = r'gog-resume-manifest.dat'  # legacy eval()-based format; kept only as a one-time migration source
+MANIFEST_JSON_FILENAME = r'gog-manifest.json'
+RESUME_MANIFEST_JSON_FILENAME = r'gog-resume-manifest.json'
 TEMP_EXT = r'.tmp'
 BACKUP_EXT = r'.bak'
 CONFIG_FILENAME = r'gog-config.dat'
@@ -174,6 +177,7 @@ HTTP_RETRY_COUNT = 4
 HTTP_TIMEOUT = 60
 
 HTTP_GAME_DOWNLOADER_THREADS = 4
+HTTP_UPDATE_FETCH_THREADS = 4  # concurrent HEAD/MD5-XML lookups per game during 'update'; matches the download-thread precedent above
 HTTP_PERM_ERRORCODES = (404, 403) #503 was in here GOG uses it as a request to wait for a bit when it's under stress. The time out appears to be ~10 seconds in such cases.  
 USER_AGENT = 'GOGRepoC/' + str(__version__)
 
@@ -536,56 +540,74 @@ def move_with_increment_on_clash(src,dst,count=0):
     else:
         move_with_increment_on_clash(src,dst,count+1)
     
-def load_manifest(filepath=MANIFEST_FILENAME):
-    info('loading local manifest...')
+def _load_legacy_manifest(filepath=MANIFEST_FILENAME):
+    """Loads a manifest in the old eval()-based Python-literal format. Only used as
+    a one-time migration source by load_manifest() when no JSON manifest exists yet
+    -- new manifests are never written in this format anymore (see save_manifest()).
+    """
+    info('loading local manifest (legacy format)...')
     try:
         with compat_open(filepath, mode='r' + universalLineEnd, encoding='utf-8') as r:
-#            ad = r.read().replace('{', 'AttrDict(**{').replace('}', '})')
             ad = r.read()
     except IOError:
         return []
 
-    compiledregexclose = re.compile(r"'changelog':.*?'changelog_end':|'changelog':.*?'downloads':|'Report-To':.*?'Server':|'report-to':.*?'server':|(})",re.DOTALL)
-    compiledregexopen =  re.compile(r"'changelog':.*?'changelog_end':|'changelog':.*?'downloads':|'Report-To':.*?'Server':|'report-to':.*?'server':|({)",re.DOTALL)
-    #compiledregexmungeopen = re.compile(r"((?:AttrDict\(**)+{")
-    #compiledregexmungeclose = re.compile(r"}\)+")
     compiledregexmunge = re.compile(r"((?:AttrDict\(\*\*)+{)(.*?)(}\)+)")
-    
-    def myreplacementopen(m):
-        if m.group(1):
-           return "AttrDict(**{"
-        else:
-           return m.group(0)
-    def myreplacementclose(m):
-        if m.group(1):
-            return "})"
-        else:
-            return m.group(0)
+
     def mungereplacement(m):
-        return "{" + m.group(2) + "}"   
-    
-    mungeDetected = compiledregexmunge.search(ad)    
+        return "{" + m.group(2) + "}"
+
+    mungeDetected = compiledregexmunge.search(ad)
     if mungeDetected:
-        warn("detected AttrDict error in manifest")        
-        while(compiledregexmunge.search(ad)): 
-            ad = compiledregexmunge.sub(mungereplacement,ad)    
+        warn("detected AttrDict error in manifest")
+        while(compiledregexmunge.search(ad)):
+            ad = compiledregexmunge.sub(mungereplacement,ad)
         warn("fixed AttrDict in manifest. If this occurs more than once please report it to the maintainer.")
 
-    ad =  compiledregexopen.sub(myreplacementopen,ad)
-    ad =  compiledregexclose.sub(myreplacementclose,ad)
+    # A handful of fields (changelog text, and raw 'Report-To'/'Server' HTTP header
+    # dumps) can contain literal '{'/'}' characters as plain string content, so those
+    # spans must not be touched by the brace -> AttrDict(**{ conversion below.
+    protected_re = re.compile(
+        r"'changelog':.*?'changelog_end':|'changelog':.*?'downloads':"
+        r"|'Report-To':.*?'Server':|'report-to':.*?'server':", re.DOTALL)
+
+    placeholders = []
+    def stash_protected(m):
+        placeholders.append(m.group(0))
+        return "\x00%d\x00" % (len(placeholders) - 1)
+
+    ad = protected_re.sub(stash_protected, ad)
+    ad = ad.replace('{', 'AttrDict(**{').replace('}', '})')
+    if placeholders:
+        placeholder_re = re.compile(r"\x00(\d+)\x00")
+        ad = placeholder_re.sub(lambda m: placeholders[int(m.group(1))], ad)
 
     if (sys.version_info[0] >= 3):
         ad = re.sub(r"'size': ([0-9]+)L,",r"'size': \1,",ad)
     db = eval(ad)
     if (mungeDetected):
-        try:
-            save_manifest(db,filepath)
-        except IOError:
-            error("Could not save repaired manifest, aborting")
-            raise SystemExit(1)
+        info("repaired manifest will be re-saved in JSON format on this load")
     return db
 
-def save_manifest(items,filepath=MANIFEST_FILENAME,update_md5_xml=False,delete_md5_xml=False):
+
+def load_manifest(filepath=MANIFEST_JSON_FILENAME):
+    info('loading local manifest...')
+    if os.path.exists(filepath):
+        try:
+            with compat_open(filepath, mode='r', encoding='utf-8') as r:
+                return json.load(r, object_hook=lambda d: AttrDict(**d))
+        except IOError:
+            return []
+    # No JSON manifest yet -- migrate from the legacy eval()-based .dat manifest, if
+    # any exists. The legacy file is left in place (not deleted), so downgrading is
+    # still possible.
+    legacy_items = _load_legacy_manifest(MANIFEST_FILENAME)
+    if legacy_items:
+        info('migrating manifest to JSON format ({})...'.format(filepath))
+        save_manifest(legacy_items, filepath)
+    return legacy_items
+
+def save_manifest(items,filepath=MANIFEST_JSON_FILENAME,update_md5_xml=False,delete_md5_xml=False):
     if update_md5_xml:
         #existing_md5s = []
         all_items_by_title = {}    
@@ -708,38 +730,44 @@ def save_manifest(items,filepath=MANIFEST_FILENAME,update_md5_xml=False,delete_m
                     
     save_manifest_core(items,filepath)
 
-def save_manifest_core_worker(items,filepath,hasManifestPropsItem=False):
+def save_manifest_core_worker(items,filepath):
     tmp_path = filepath+TEMP_EXT
     bak_path = filepath+BACKUP_EXT
-    if os.path.exists(filepath):
-        shutil.copy(filepath,tmp_path)
-    len_adjustment = 0
-    if (hasManifestPropsItem):
-        len_adjustment = -1
+    # (Does not copy the old file to tmp_path here first: tmp_path is opened in 'w'
+    # mode immediately below, which truncates and fully rewrites it regardless, so
+    # that copy -- of a manifest that can be tens of MB -- would be pure wasted I/O.)
+    # ensure_ascii=False keeps non-English language names/text as readable UTF-8
+    # rather than \uXXXX escapes; sort_keys defaults to False, preserving insertion
+    # order (matters no more than it did for the old pprint format -- eval/json.load
+    # both reconstruct dicts regardless of on-disk key order -- but keeps the file
+    #'s layout closer to what a human skimming it would expect).
     with compat_open(tmp_path, mode='w', encoding='utf-8') as w:
-        print('# {} games'.format(len(items)+len_adjustment), file=w)
-        pprint.pprint(items, width=123, stream=w)
+        json.dump(items, w, indent=1, ensure_ascii=False)
     if os.path.exists(bak_path):
         os.remove(bak_path)
     if os.path.exists(filepath):
         shutil.move(filepath,bak_path)
-    shutil.move(tmp_path,filepath)    
+    shutil.move(tmp_path,filepath)
 
 
-def save_manifest_core(items,filepath=MANIFEST_FILENAME):    
+def save_manifest_core(items,filepath=MANIFEST_JSON_FILENAME):
     info('saving manifest...')
     save_manifest_core_worker(items,filepath)
     info('saved manifest')
-    
+
 
 
 def save_resume_manifest(items):
     info('saving resume manifest...')
-    save_manifest_core_worker(items,RESUME_MANIFEST_FILENAME,True)
-    info('saved resume manifest')      
- 
-def load_resume_manifest(filepath=RESUME_MANIFEST_FILENAME):
-    info('loading local resume manifest...')
+    save_manifest_core_worker(items,RESUME_MANIFEST_JSON_FILENAME)
+    info('saved resume manifest')
+
+def _load_legacy_resume_manifest(filepath=RESUME_MANIFEST_FILENAME):
+    """Loads a resume manifest in the old eval()-based Python-literal format. Only
+    used as a one-time migration source by load_resume_manifest() when no JSON
+    resume manifest exists yet.
+    """
+    info('loading local resume manifest (legacy format)...')
     try:
         with compat_open(filepath, mode='r' + universalLineEnd, encoding='utf-8') as r:
             ad = r.read().replace('{', 'AttrDict(**{').replace('}', '})')
@@ -748,6 +776,20 @@ def load_resume_manifest(filepath=RESUME_MANIFEST_FILENAME):
         return eval(ad)
     except IOError:
         return []
+
+def load_resume_manifest(filepath=RESUME_MANIFEST_JSON_FILENAME):
+    info('loading local resume manifest...')
+    if os.path.exists(filepath):
+        try:
+            with compat_open(filepath, mode='r', encoding='utf-8') as r:
+                return json.load(r, object_hook=lambda d: AttrDict(**d))
+        except IOError:
+            return []
+    legacy_items = _load_legacy_resume_manifest(RESUME_MANIFEST_FILENAME)
+    if legacy_items:
+        info('migrating resume manifest to JSON format ({})...'.format(filepath))
+        save_manifest_core_worker(legacy_items, filepath)
+    return legacy_items
         
 def save_config_file(items):
     info('saving config...')
@@ -800,14 +842,20 @@ def hashstream(stream,start,end):
         raise
     return hasher.hexdigest()
 
-def hashfile(afile, blocksize=65536):
-    afile = open(afile, 'rb')
-    hasher = hashlib.md5()
-    buf = afile.read(blocksize)
-    while len(buf) > 0:
-        hasher.update(buf)
-        buf = afile.read(blocksize)
-    return hasher.hexdigest()
+def hashfile(afile, blocksize=1024*1024):
+    with open(afile, 'rb') as f:
+        # hashlib.file_digest (3.11+) hashes via a reused buffer with far less
+        # per-chunk Python overhead than a manual read loop -- meaningfully faster
+        # for the multi-GB installers this tool verifies. Fall back to the manual
+        # loop (with a larger block size than before) on older Python.
+        if hasattr(hashlib, 'file_digest'):
+            return hashlib.file_digest(f, 'md5').hexdigest()
+        hasher = hashlib.md5()
+        buf = f.read(blocksize)
+        while len(buf) > 0:
+            hasher.update(buf)
+            buf = f.read(blocksize)
+        return hasher.hexdigest()
 
 
 def test_zipfile(filename):
@@ -1251,188 +1299,241 @@ def fetch_file_info(d, fetch_md5,save_md5_xml,updateSession):
         else:
             d.updated = email.utils.parsedate_to_datetime(d.raw_updated).isoformat() #Standardize
 
-def filter_downloads(out_list, downloads_list, lang_list, os_list,save_md5_xml,updateSession):
-    """filters any downloads information against matching lang and os, translates
-    them, and extends them into out_list
+def _resolve_download_entry(download, os_type, lang, save_md5_xml, updateSession):
+    """Fetches file info (and md5, if available) for a single download entry,
+    trying its candidate hrefs in order until one succeeds. Returns the single
+    AttrDict that filter_downloads would have appended for this entry. Pulled out
+    of filter_downloads so it can be run concurrently across many downloads at once.
     """
-    filtered_downloads = []
+    tempd = download['manualUrl']
+    if tempd[:10] == "/downloads":
+        tempd = "/downlink" +tempd[10:]
+    hrefs = [GOG_HOME_URL + download['manualUrl'],GOG_HOME_URL + tempd]
+    href_ds = []
+    file_info_success = False
+    md5_success = False
+    unreleased = False
+    for href in hrefs:
+        if not (unreleased or (file_info_success and md5_success)):
+            debug("trying to fetch file info from %s" % href)
+            file_info_success = False
+            md5_success = False
+            # passed the filter, create the entry
+            d = AttrDict(desc=download['name'],
+                         os_type=os_type,
+                         lang=lang,
+                         version=download['version'],
+                         href= href,
+                         md5=None,
+                         name=None,
+                         size=None,
+                         prev_verified=False,
+                         old_name=None,
+                         unreleased = False,
+                         md5_exempt = False,
+                         gog_data = AttrDict(),
+                         updated = None,
+                         old_updated = None,
+                         force_change = False,
+                         old_force_change = None
+                         )
+            for key in download:
+                try:
+                    tmp_contents = d[key]
+                    if tmp_contents != download[key]:
+                        debug("GOG Data Key, %s , for download clashes with Download Data Key storing detailed info in secondary dict" % key)
+                        d.gog_data[key] = download[key]
+                except Exception:
+                    d[key] = download[key]
+            if d.gog_data.size == "0 MB":#Not Available
+                warn("Unreleased File, Skipping Data Fetching %s" % d.desc)
+                d.unreleased = True
+                unreleased = True
+            else: #Available
+                try:
+                    fetch_file_info(d, True,save_md5_xml,updateSession)
+                    file_info_success = True
+                except requests.HTTPError:
+                    warn("failed to fetch %s" % (d.href))
+                except Exception:
+                    warn("failed to fetch %s and because of non-HTTP Error" % (d.href))
+                    warn("The handled exception was:")
+                    log_exception('')
+                    warn("End exception report.")
+                if d.md5_exempt == True or d.md5 != None:
+                    md5_success = True
+
+            href_ds.append([d,file_info_success,md5_success])
+    if unreleased:
+        debug("File Not Available For Manual Download Storing Canonical Link: %s" % d.href)
+        return d
+    elif file_info_success and md5_success: #Will be the current d because no more are created once we're successful
+        debug("Successfully fetched file info and md5 from %s" % d.href)
+        return d
+    else: #Check for first file info success since all MD5s failed.
+        for href_d in href_ds:
+            if (href_d[1]) == True:
+                warn("Successfully fetched file info from %s but no md5 data was available" % href_d[0].href)
+                return href_d[0]
+        #None worked so go with the canonical link
+        error("Could not fetch file info so using canonical link: %s" % href_ds[0][0].href)
+        return href_ds[0][0]
+
+
+def _collect_download_candidates(downloads_list, lang_list, os_list):
+    """Pure (no network) traversal of a downloads_list -- the raw GOG JSON shape, a
+    list of (lang, {os_type: [download, ...]}) pairs -- into a flat list of
+    (download, os_type, lang) tuples for every entry passing the lang/os filter, in
+    the same order the old nested-loop code would have visited them. Split out of
+    filter_downloads so filter_dlcs can collect candidates from many DLCs' downloads
+    lists and fetch them all through one shared thread pool.
+    """
     downloads_dict = dict(downloads_list)
-
-    # hold list of valid languages languages as known by gogapi json stuff
-    valid_langs = []
-    for lang in lang_list:
-        valid_langs.append(LANG_TABLE[lang])
-
-    # check if lang/os combo passes the specified filter
+    valid_langs = [LANG_TABLE[lang] for lang in lang_list]
+    candidates = []
     for lang in downloads_dict:
         if lang in valid_langs:
             for os_type in downloads_dict[lang]:
                 if os_type in os_list:
                     for download in downloads_dict[lang][os_type]:
-                        tempd = download['manualUrl']
-                        if tempd[:10] == "/downloads":
-                            tempd = "/downlink" +tempd[10:]
-                        hrefs = [GOG_HOME_URL + download['manualUrl'],GOG_HOME_URL + tempd]
-                        href_ds = []
-                        file_info_success = False
-                        md5_success = False
-                        unreleased = False
-                        for href in hrefs:
-                            if not (unreleased or (file_info_success and md5_success)):
-                                debug("trying to fetch file info from %s" % href)
-                                file_info_success = False
-                                md5_success = False
-                                # passed the filter, create the entry
-                                d = AttrDict(desc=download['name'],
-                                             os_type=os_type,
-                                             lang=lang,
-                                             version=download['version'],
-                                             href= href,
-                                             md5=None,
-                                             name=None,
-                                             size=None,
-                                             prev_verified=False,
-                                             old_name=None,
-                                             unreleased = False,
-                                             md5_exempt = False,
-                                             gog_data = AttrDict(),
-                                             updated = None,
-                                             old_updated = None,
-                                             force_change = False,
-                                             old_force_change = None
-                                             )
-                                for key in download:
-                                    try:
-                                        tmp_contents = d[key]
-                                        if tmp_contents != download[key]:
-                                            debug("GOG Data Key, %s , for download clashes with Download Data Key storing detailed info in secondary dict" % key)
-                                            d.gog_data[key] = download[key]
-                                    except Exception:
-                                        d[key] = download[key]             
-                                if d.gog_data.size == "0 MB":#Not Available
-                                    warn("Unreleased File, Skipping Data Fetching %s" % d.desc)
-                                    d.unreleased = True
-                                    unreleased = True
-                                else: #Available
-                                    try:
-                                        #head_response = request_head(updateSession,d.href)
-                                        #with compat_open('head_test_headers.txt', mode='w', encoding='utf-8') as w:
-                                        #    w.write(str(head_response.headers))
-                                        #shelf_head.etree = xml.etree.ElementTree.fromstring(head_response.content)
-                                        fetch_file_info(d, True,save_md5_xml,updateSession)
-                                        file_info_success = True
-                                    except requests.HTTPError:
-                                        warn("failed to fetch %s" % (d.href))
-                                    except Exception:
-                                        warn("failed to fetch %s and because of non-HTTP Error" % (d.href))
-                                        warn("The handled exception was:")
-                                        log_exception('')
-                                        warn("End exception report.")
-                                    if d.md5_exempt == True or d.md5 != None:
-                                        md5_success = True
-  
-                                    
-                                href_ds.append([d,file_info_success,md5_success])
-                        if unreleased:
-                            debug("File Not Available For Manual Download Storing Canonical Link: %s" % d.href)
-                            filtered_downloads.append(d)
-                        elif file_info_success and md5_success: #Will be the current d because no more are created once we're successful
-                            debug("Successfully fetched file info and md5 from %s" % d.href)
-                            filtered_downloads.append(d)
-                        else: #Check for first file info success since all MD5s failed.
-                            any_file_info_success = False
-                            for href_d in href_ds:
-                                if not any_file_info_success:
-                                    if (href_d[1]) == True:
-                                        any_file_info_success = True
-                                        filtered_downloads.append(href_d[0])
-                                        warn("Successfully fetched file info from %s but no md5 data was available" % href_d[0].href)
-                            if not any_file_info_success:
-                                #None worked so go with the canonical link
-                                error("Could not fetch file info so using canonical link: %s" % href_ds[0][0].href)
-                                filtered_downloads.append(href_ds[0][0])
-    out_list.extend(filtered_downloads)
+                        candidates.append((download, os_type, lang))
+    return candidates
+
+
+def _run_threaded_fetch(candidates, resolve_fn, num_threads=HTTP_UPDATE_FETCH_THREADS):
+    """Resolves each item in candidates via resolve_fn using a bounded pool of
+    worker threads (each candidate's HEAD/MD5-XML lookups are independent network
+    calls). Results are written back by index rather than appended as they
+    complete, so the returned list is in exactly the same order as candidates,
+    regardless of which thread finishes first -- that order is what
+    deDuplicateName() uses to assign numeric suffixes to same-named files, so
+    preserving it keeps generated filenames deterministic.
+    """
+    results = [None] * len(candidates)
+    if not candidates:
+        return results
+
+    work = Queue()
+    for index, candidate in enumerate(candidates):
+        work.put((index, candidate))
+
+    def worker():
+        while True:
+            try:
+                index, candidate = work.get_nowait()
+            except Empty:
+                return
+            results[index] = resolve_fn(candidate)
+
+    threads = []
+    for _ in range(min(num_threads, len(candidates))):
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    return results
+
+
+def filter_downloads(out_list, downloads_list, lang_list, os_list,save_md5_xml,updateSession):
+    """filters any downloads information against matching lang and os, translates
+    them, and extends them into out_list
+    """
+    candidates = _collect_download_candidates(downloads_list, lang_list, os_list)
+    resolved = _run_threaded_fetch(
+        candidates,
+        lambda c: _resolve_download_entry(c[0], c[1], c[2], save_md5_xml, updateSession))
+    out_list.extend(resolved)
+
+
+def _resolve_extra_entry(extra, save_md5_xml, updateSession):
+    """Fetches file info for a single extra entry, trying its candidate hrefs in
+    order until one succeeds. Returns the single AttrDict that filter_extras would
+    have appended for this entry. Pulled out of filter_extras so it can be run
+    concurrently across many extras at once.
+    """
+    tempd = extra['manualUrl']
+    if tempd[:10] == "/downloads":
+        tempd = "/downlink" +tempd[10:]
+    hrefs = [GOG_HOME_URL + extra['manualUrl'],GOG_HOME_URL + tempd]
+    href_ds = []
+    file_info_success = False
+    unreleased = False
+    for href in hrefs:
+        if not (unreleased or file_info_success):
+            debug("trying to fetch file info from %s" % href)
+            file_info_success = False
+            d = AttrDict(desc=extra['name'],
+                         os_type='extra',
+                         lang='',
+                         version=None,
+                         href= href,
+                         md5=None,
+                         name=None,
+                         size=None,
+                         prev_verified=False,
+                         old_name = None,
+                         unreleased = False,
+                         gog_data = AttrDict(),
+                         updated = None,
+                         old_updated = None,
+                         force_change = False,
+                         old_force_change = None
+                         )
+            for key in extra:
+                try:
+                    tmp_contents = d[key]
+                    if tmp_contents != extra[key]:
+                        debug("GOG Data Key, %s , for extra clashes with Extra Data Key storing detailed info in secondary dict" % key)
+                        d.gog_data[key] = extra[key]
+                except Exception:
+                    d[key] = extra[key]
+            if d.gog_data.size == "0 MB":#Not Available
+                debug("Unreleased File, Skipping Data Fetching %s" % d.desc)
+                d.unreleased = True
+                unreleased = True
+            else:
+                try:
+                    fetch_file_info(d, False,save_md5_xml,updateSession)
+                    file_info_success = True
+                except requests.HTTPError:
+                    warn("failed to fetch %s" % d.href)
+                except Exception:
+                    warn("failed to fetch %s because of non-HTTP Error" % d.href)
+                    warn("The handled exception was:")
+                    log_exception('')
+                    warn("End exception report.")
+            href_ds.append([d,file_info_success])
+    if unreleased:
+        debug("File Not Available For Manual Download Storing Canonical Link: %s" % d.href)
+        return d
+    elif file_info_success: #Will be the current d because no more are created once we're successful
+        debug("Successfully fetched file info from %s" % d.href)
+        return d
+    else:
+        #None worked so go with the canonical link
+        error("Could not fetch file info so using canonical link: %s" % href_ds[0][0].href)
+        return href_ds[0][0]
 
 
 def filter_extras(out_list, extras_list,save_md5_xml,updateSession):
     """filters and translates extras information and adds them into out_list
     """
-    filtered_extras = []
-
-    for extra in extras_list:
-        tempd = extra['manualUrl']
-        if tempd[:10] == "/downloads":
-            tempd = "/downlink" +tempd[10:]
-        hrefs = [GOG_HOME_URL + extra['manualUrl'],GOG_HOME_URL + tempd]
-        href_ds = []
-        file_info_success = False
-        unreleased = False
-        for href in hrefs:
-            if not (unreleased or file_info_success):
-                debug("trying to fetch file info from %s" % href)
-                file_info_success = False
-                d = AttrDict(desc=extra['name'],
-                             os_type='extra',
-                             lang='',
-                             version=None,
-                             href= href,
-                             md5=None,
-                             name=None,
-                             size=None,
-                             prev_verified=False,
-                             old_name = None,
-                             unreleased = False,
-                             gog_data = AttrDict(),
-                             updated = None,
-                             old_updated = None,
-                             force_change = False,
-                             old_force_change = None
-                             )
-                for key in extra:
-                    try:
-                        tmp_contents = d[key]
-                        if tmp_contents != extra[key]:
-                            debug("GOG Data Key, %s , for extra clashes with Extra Data Key storing detailed info in secondary dict" % key)
-                            d.gog_data[key] = extra[key]
-                    except Exception:
-                        d[key] = extra[key]
-                if d.gog_data.size == "0 MB":#Not Available
-                    debug("Unreleased File, Skipping Data Fetching %s" % d.desc)
-                    d.unreleased = True
-                    unreleased = True
-                else:
-                    try:
-                        #head_response = request_head(updateSession,d.href)
-                        #with compat_open('head_test_headers.txt', mode='w', encoding='utf-8') as w:
-                        #    w.write(str(head_response.headers))
-                        fetch_file_info(d, False,save_md5_xml,updateSession)
-                        file_info_success = True
-                    except requests.HTTPError:
-                        warn("failed to fetch %s" % d.href)
-                    except Exception:
-                        warn("failed to fetch %s because of non-HTTP Error" % d.href)
-                        warn("The handled exception was:")
-                        log_exception('')
-                        warn("End exception report.")
-                href_ds.append([d,file_info_success])
-        if unreleased:
-            debug("File Not Available For Manual Download Storing Canonical Link: %s" % d.href)
-            filtered_extras.append(d)
-        elif file_info_success: #Will be the current d because no more are created once we're successful
-            debug("Successfully fetched file info from %s" % d.href)
-            filtered_extras.append(d)
-        else:
-            #None worked so go with the canonical link
-            error("Could not fetch file info so using canonical link: %s" % href_ds[0][0].href)
-            filtered_extras.append(href_ds[0][0])
-    out_list.extend(filtered_extras)
+    resolved = _run_threaded_fetch(
+        extras_list,
+        lambda extra: _resolve_extra_entry(extra, save_md5_xml, updateSession))
+    out_list.extend(resolved)
 
 
-def filter_dlcs(item, dlc_list, lang_list, os_list,save_md5_xml,updateSession):
-    """filters any downloads/extras information against matching lang and os, translates
-    them, and adds them to the item downloads/extras
-
-    dlcs can contain dlcs in a recursive fashion, and oddly GOG does do this for some titles.
+def _collect_dlc_bookkeeping_and_sources(item, dlc_list, dlc_sources):
+    """Pure (no network) pre-order walk of a (possibly recursive) dlc_list: performs
+    the title-deduplication / bg_urls / serials bookkeeping exactly as before -- this
+    part is inherently sequential and order-sensitive (each DLC's potential_title
+    depends on which titles earlier DLCs already claimed) -- and appends each DLC's
+    raw (downloads, galaxyDownloads, extras) lists to dlc_sources, in the same
+    pre-order the old code would have fetched them in. Fetching itself happens
+    afterward, once, in filter_dlcs -- see there for why.
     """
     for dlc_dict in dlc_list:
         base_title = dlc_dict['title']
@@ -1450,7 +1551,7 @@ def filter_dlcs(item, dlc_list, lang_list, os_list,save_md5_xml,updateSession):
                 if (not(item.serials[potential_title].isprintable())): #Probably encoded in UTF-16
                     pserial = item.serials[potential_title]
                     if (len(pserial) % 2): #0dd
-                        pserial=pserial+"\x00" 
+                        pserial=pserial+"\x00"
                     pserial = bytes(pserial,"UTF-8")
                     pserial = pserial.decode("UTF-16")
                     if pserial.isprintable():
@@ -1461,7 +1562,7 @@ def filter_dlcs(item, dlc_list, lang_list, os_list,save_md5_xml,updateSession):
                 if not (all(c in string.printable for c in  item.serial)):
                     pserial = item.serials[potential_title]
                     if (len(pserial) % 2): #0dd
-                        pserial=pserial+"\x00" 
+                        pserial=pserial+"\x00"
                     pserial = bytearray(pserial,"UTF-8")
                     pserial = pserial.decode("UTF-16")
                     if all(c in string.printable for c in  item.serial):
@@ -1469,10 +1570,47 @@ def filter_dlcs(item, dlc_list, lang_list, os_list,save_md5_xml,updateSession):
                         item.serials[potential_title] = pserial
                     else:
                         warn('DLC serial code is unprintable for %s, storing raw',potential_title)
-        filter_downloads(item.downloads, dlc_dict['downloads'], lang_list, os_list,save_md5_xml,updateSession)
-        filter_downloads(item.galaxyDownloads, dlc_dict['galaxyDownloads'], lang_list, os_list,save_md5_xml,updateSession)
-        filter_extras(item.extras, dlc_dict['extras'],save_md5_xml,updateSession)
-        filter_dlcs(item, dlc_dict['dlcs'], lang_list, os_list,save_md5_xml,updateSession)  # recursive
+        dlc_sources.append((dlc_dict['downloads'], dlc_dict['galaxyDownloads'], dlc_dict['extras']))
+        _collect_dlc_bookkeeping_and_sources(item, dlc_dict['dlcs'], dlc_sources)  # recursive, pre-order
+
+
+def filter_dlcs(item, dlc_list, lang_list, os_list,save_md5_xml,updateSession):
+    """filters any downloads/extras information against matching lang and os, translates
+    them, and adds them to the item downloads/extras
+
+    dlcs can contain dlcs in a recursive fashion, and oddly GOG does do this for some titles.
+    """
+    # Titles/serials bookkeeping first (sequential, order matters), collecting every
+    # DLC's raw downloads/galaxyDownloads/extras lists along the way.
+    dlc_sources = []
+    _collect_dlc_bookkeeping_and_sources(item, dlc_list, dlc_sources)
+
+    # Then fetch: one shared thread pool per destination list, covering every DLC's
+    # entries at once, instead of the old one-DLC-at-a-time sequential
+    # filter_downloads/filter_extras calls (each with its own pool that had to fully
+    # finish before the next DLC's pool could start). A game with many DLCs no
+    # longer pays for each DLC's fetch wave back to back -- everything shares the
+    # same HTTP_UPDATE_FETCH_THREADS budget, so total concurrency stays unchanged,
+    # just used more continuously. Final item.downloads/galaxyDownloads/extras order
+    # is unchanged: base game entries (already added by the caller), then each DLC's
+    # entries in the same pre-order as before.
+    download_candidates = []
+    galaxy_candidates = []
+    extras_candidates = []
+    for downloads_list, galaxy_list, extras_list in dlc_sources:
+        download_candidates.extend(_collect_download_candidates(downloads_list, lang_list, os_list))
+        galaxy_candidates.extend(_collect_download_candidates(galaxy_list, lang_list, os_list))
+        extras_candidates.extend(extras_list)
+
+    item.downloads.extend(_run_threaded_fetch(
+        download_candidates,
+        lambda c: _resolve_download_entry(c[0], c[1], c[2], save_md5_xml, updateSession)))
+    item.galaxyDownloads.extend(_run_threaded_fetch(
+        galaxy_candidates,
+        lambda c: _resolve_download_entry(c[0], c[1], c[2], save_md5_xml, updateSession)))
+    item.extras.extend(_run_threaded_fetch(
+        extras_candidates,
+        lambda extra: _resolve_extra_entry(extra, save_md5_xml, updateSession)))
         
 def deDuplicateList(duplicatedList,existingItems,strictDupe):   
     deDuplicatedList = []
@@ -1914,11 +2052,6 @@ def cmd_login(user, passwd):
     else:
         error('Galaxy login failed, verify your username/password and try again.')
 
-def makeGitHubSession(authenticatedSession=False):
-    gitSession = requests.Session()
-    gitSession.headers={'User-Agent':USER_AGENT,'Accept':'application/vnd.github.v3+json'}
-    return gitSession    
-        
 def makeGOGSession(loginSession=False):
     gogSession = requests.Session()
     if not loginSession:
@@ -2223,6 +2356,9 @@ def cmd_update(os_list, lang_list, skipknown, updateonly, partial, ids, skipids,
     save_resume_manifest(resumedb)                    
     
     resumedbInitLength = len(resumedb)
+    # id -> index into gamesdb, maintained incrementally below instead of calling
+    # item_checkdb() (a linear scan) for every one of potentially thousands of items.
+    gamesdb_index = {g.id: i for i, g in enumerate(gamesdb)}
     for item in sorted(items, key=lambda item: item.title):
         api_url  = GOG_ACCOUNT_URL
         api_url += "/gameDetails/{}.json".format(item.id)
@@ -2324,32 +2460,38 @@ def cmd_update(os_list, lang_list, skipknown, updateonly, partial, ids, skipids,
             item.extras = deDuplicateList(item.extras,existingItems,strictDupe)
 
             # update gamesdb with new item
-            item_idx = item_checkdb(item.id, gamesdb)
+            item_idx = gamesdb_index.get(item.id)
             if item_idx is not None:
                 handle_game_updates(gamesdb[item_idx], item,strict, strictDownloadsUpdate, strictExtrasUpdate)
                 gamesdb[item_idx] = item
             else:
+                gamesdb_index[item.id] = len(gamesdb)
                 gamesdb.append(item)
         except Exception:
             warn("The handled exception was:")
             log_exception('error')
             warn("End exception report.")        
-        resumedb.remove(item)    
-        if (updateonly or skipknown or (resumedbInitLength - len(resumedb)) % RESUME_SAVE_THRESHOLD == 0):
-            save_manifest(gamesdb)                
-            save_resume_manifest(resumedb)                
+        resumedb.remove(item)
+        if ((resumedbInitLength - len(resumedb)) % RESUME_SAVE_THRESHOLD == 0):
+            save_manifest(gamesdb)
+            save_resume_manifest(resumedb)
 
+    # Single pass over the title-sorted list grouping consecutive same-title runs.
+    # (Previously this re-scanned sorted_gamesdb with .index() and a linear "in global_dupes"
+    # membership test for every game -- an O(n^2) walk with expensive deep AttrDict comparisons.)
     global_dupes = []
     sorted_gamesdb =  sorted(gamesdb, key = lambda game : game.title)
-    for game in sorted_gamesdb:
-        if game not in global_dupes:
-            index = sorted_gamesdb.index(game)
-            dupes = [game]
-            while (len(sorted_gamesdb)-1 >= index+1 and sorted_gamesdb[index+1].title == game.title):
-                dupes.append(sorted_gamesdb[index+1])
-                index = index + 1
-            if len(dupes) > 1:
-                global_dupes.extend(dupes)
+    index = 0
+    while index < len(sorted_gamesdb):
+        game = sorted_gamesdb[index]
+        dupes = [game]
+        next_index = index + 1
+        while next_index < len(sorted_gamesdb) and sorted_gamesdb[next_index].title == game.title:
+            dupes.append(sorted_gamesdb[next_index])
+            next_index += 1
+        if len(dupes) > 1:
+            global_dupes.extend(dupes)
+        index = next_index
             
     for dupe in global_dupes:
         dupe.folder_name = dupe.title + "_" + str(dupe.id)
@@ -2472,6 +2614,7 @@ def cmd_import(src_dir, dest_dir,os_list,lang_list,skipextras,skipids,ids,skipga
                 file_list.append(os.path.join(root, f))
 
     info("comparing md5 file hashes")
+    manifest_dirty = False
     for f in file_list:
         fname = os.path.basename(f)
         info("calculating filesize for '%s'" % fname)
@@ -2523,7 +2666,14 @@ def cmd_import(src_dir, dest_dir,os_list,lang_list,skipextras,skipids,ids,skipga
                         setattr(entry,"prev_verified",True)
                         changed = True
                     if changed:
-                        save_manifest(gamesdb)
+                        manifest_dirty = True
+
+    # Saving the whole manifest after every single matched/copied file made an import of
+    # many files cost O(n^2) in disk I/O. A single save at the end is sufficient since an
+    # interrupted import is safely resumable (already-copied files are size/md5-matched
+    # and skipped on the next run).
+    if manifest_dirty:
+        save_manifest(gamesdb)
 
 def cmd_download(savedir, skipextras,skipids, dryrun, ids,os_list, lang_list,skipgalaxy,skipstandalone,skipshared, skipfiles,covers,backgrounds,skippreallocation,clean_old_images,downloadLimit = None):
     sizes, rates, errors = {}, {}, {}
@@ -3035,13 +3185,28 @@ def cmd_download(savedir, skipextras,skipids, dryrun, ids,os_list, lang_list,ski
     # work item I/O loop
     def ioloop(tid, path, response, out):
         #info("Entering I/O Loop - " + path)
+        # A single watchdog thread per download tracks the time of the last received
+        # chunk and kills the response if it stalls for longer than HTTP_TIMEOUT.
+        # (Previously a new threading.Timer -- and thus a new OS thread -- was created
+        # and cancelled for *every* 4KB chunk, which for a multi-GB file meant millions
+        # of thread spawns and was the dominant cost of a download.)
         sz, t0 = True, time.time()
         dlsz = 0
-        responseTimer = threading.Timer(HTTP_TIMEOUT,killresponse,[response])
-        responseTimer.start()
+        last_activity = [t0]
+        stop_watchdog = threading.Event()
+
+        def watchdog():
+            while not stop_watchdog.wait(1):
+                if time.time() - last_activity[0] > HTTP_TIMEOUT:
+                    killresponse(response)
+                    return
+
+        watchdogThread = threading.Thread(target=watchdog)
+        watchdogThread.daemon = True
+        watchdogThread.start()
         try:
-            for chunk in response.iter_content(chunk_size=4*1024):
-                responseTimer.cancel()
+            for chunk in response.iter_content(chunk_size=64*1024):
+                last_activity[0] = time.time()
                 if (chunk):
                     t = time.time()
                     out.write(chunk)
@@ -3050,17 +3215,15 @@ def cmd_download(savedir, skipextras,skipids, dryrun, ids,os_list, lang_list,ski
                     with lock:
                         sizes[path] -= sz
                         rates.setdefault(path, []).append((tid, (sz, dt)))
-                responseTimer = threading.Timer(HTTP_TIMEOUT,killresponse,[response])
-                responseTimer.start()
         except (requests.exceptions.ConnectionError,requests.packages.urllib3.exceptions.ProtocolError) as e:
             error("server response issue while downloading content for %s" % (path))
         except (requests.exceptions.SSLError) as e:
             error("SSL issue while downloading content for %s" % (path))
         except (requests.exceptions.ChunkedEncodingError) as e:
             error("Encoding Error In Chunk for %s" %  (path))
-        responseTimer.cancel()
+        stop_watchdog.set()
         #info("Exiting I/O Loop - " + path)
-        return dlsz            
+        return dlsz
 
     # downloader worker thread main loop
     def worker():
@@ -3622,8 +3785,15 @@ def cmd_verify(gamedir, skipextras, skipids,  check_md5, check_filesize, check_z
         if not os.path.isdir(orphan_root_dir):
             os.makedirs(orphan_root_dir)
 
-        
-        
+    # id -> index into items, used instead of item_checkdb() (a linear scan) below.
+    # Indices stay valid for the whole loop since games are only replaced in place
+    # (items[item_idx] = game), never inserted or removed.
+    items_index = {g.id: i for i, g in enumerate(items)}
+    # Verifying (hashing/checking) a large library can touch thousands of files; saving
+    # the *entire* manifest to disk after every single changed game turns that into an
+    # O(n^2) amount of I/O. Instead, checkpoint periodically and always flush at the end.
+    changes_since_save = 0
+
     for game in games_to_check:
         game_changed = False
         try:
@@ -3786,13 +3956,19 @@ def cmd_verify(gamedir, skipextras, skipids,  check_md5, check_filesize, check_z
                 info('missing file %s' % itm_dirpath)
                 missing_cnt += 1
         if (game_changed):
-            item_idx = item_checkdb(game.id, items)
+            item_idx = items_index.get(game.id)
             if item_idx is not None:
                 items[item_idx] = game
-                save_manifest(items)
+                changes_since_save += 1
+                if changes_since_save >= RESUME_SAVE_THRESHOLD:
+                    save_manifest(items)
+                    changes_since_save = 0
             else:
                 warn("We are verifying an item that's not in the DB ???")
-        
+
+    if changes_since_save > 0:
+        save_manifest(items)
+
     info('')
     info('--totals------------')
     info('known items......... %d' % item_count)
@@ -3978,51 +4154,6 @@ def cmd_clean(cleandir, dryrun):
             save_manifest(items)
     else:
         info('nothing to clean. nice and tidy!')
-        
-def update_self():
-    #To-Do: add auto-update to main using Last-Modified (repo for rolling, latest release for standard)
-    #Add a dev mode which skips auto-updates and a manual update command which can specify rolling/standard
-    # Since 302 is not an error can use the standard session handling for this. Rewrite appropriately 
-    gitSession = makeGitHubSession()
-    #if mode = Standard
-    response = gitSession.get(REPO_HOME_URL+NEW_RELEASE_URL,stream="False",timeout=HTTP_TIMEOUT,headers={'If-Modified-Since':'Mon, 16 Jul 2018 08:51:22 GMT'})       
-    response.raise_for_status()    
-    if response.status_code == 304:
-        print("Not Modified")
-        sys.exit()
-    print(response.headers)    
-    jsonResponse = response.json()
-    print(response.headers)
-    print(jsonResponse)
-    with compat_open('updatetest.test', mode='w', encoding='utf-8') as w:
-        print(response.headers)
-        print(jsonResponse, file=w)    
-    response = gitSession.get(jsonResponse['tarball_url'],stream="False",timeout=HTTP_TIMEOUT)
-    response.raise_for_status()
-    rawResponse = response.content
-    print(response.headers)
-    with compat_open('tarballupdatetest.test', mode='w', encoding='utf-8') as w:
-        print(response.headers,file=w)
-    with open_notrunc('update.tar.gz') as w:    
-        w.write(rawResponse)
-    
-    #if mode = Rolling
-    response = gitSession.get(REPO_HOME_URL,stream="False",timeout=HTTP_TIMEOUT)        
-    response.raise_for_status()    
-    jsonResponse = response.json()
-    print(response.headers)
-    print(jsonResponse)
-    with compat_open('rollingupdatetest.test', mode='w', encoding='utf-8') as w:
-        print(response.headers,file=w)
-        print(jsonResponse, file=w)    
-    response = gitSession.get(REPO_HOME_URL+"/tarball/master",stream="False",timeout=HTTP_TIMEOUT)        
-    response.raise_for_status()    
-    rawResponse = response.content
-    print(response.headers)
-    with compat_open('tarballrollingupdatetest.test', mode='w', encoding='utf-8') as w:
-        print(response.headers,file=w)
-    with open_notrunc('rolling.tar.gz') as w:    
-        w.write(rawResponse)
         
 def purge_md5_chunkdata():
     all_games = load_manifest()
