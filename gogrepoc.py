@@ -2675,6 +2675,27 @@ def cmd_import(src_dir, dest_dir,os_list,lang_list,skipextras,skipids,ids,skipga
     if manifest_dirty:
         save_manifest(gamesdb)
 
+def _scan_dir_sizes(dirpath):
+    """Returns {filename: size} for the files directly inside dirpath, built from a
+    single directory scan instead of one os.path.isfile()/os.path.getsize() stat
+    call per file. On Windows in particular, os.scandir()'s DirEntry.stat() is
+    served from the same directory-read data the scan itself already did, not a
+    separate syscall per file -- so a game folder with dozens of files costs one
+    scan instead of dozens of individual stats. Returns {} if dirpath doesn't
+    exist (matching the old code's behavior of os.path.isfile() simply returning
+    False for a missing directory).
+    """
+    sizes = {}
+    try:
+        with os.scandir(dirpath) as it:
+            for entry in it:
+                if entry.is_file():
+                    sizes[entry.name] = entry.stat().st_size
+    except FileNotFoundError:
+        pass
+    return sizes
+
+
 def cmd_download(savedir, skipextras,skipids, dryrun, ids,os_list, lang_list,skipgalaxy,skipstandalone,skipshared, skipfiles,covers,backgrounds,skippreallocation,clean_old_images,downloadLimit = None):
     sizes, rates, errors = {}, {}, {}
     work = Queue()  # build a list of work items
@@ -3092,6 +3113,11 @@ def cmd_download(savedir, skipextras,skipids, dryrun, ids,os_list, lang_list,ski
  
 
         # Populate queue with all files to be downloaded
+        # One directory scan per game instead of an isfile()/getsize() stat call per
+        # file below -- for a library with thousands of files this replaces tens of
+        # thousands of individual filesystem calls with one scan per game folder.
+        dest_dir_sizes = _scan_dir_sizes(item_homedir)
+        provisional_dir_sizes = _scan_dir_sizes(item_provisionaldir)
         for game_item in filtered_downloads + filtered_galaxyDownloads + filtered_sharedDownloads + filtered_extras:
             if game_item.name is None:
                 continue  # no game name, usually due to 404 during file fetch
@@ -3100,17 +3126,17 @@ def cmd_download(savedir, skipextras,skipids, dryrun, ids,os_list, lang_list,ski
                 _ = game_item.force_change
             except AttributeError:
                 game_item.force_change = False
-                
+
             try:
                 _ = game_item.updated
             except AttributeError:
                 game_item.updated = None
-                
+
             try:
                 _ = game_item.old_updated
             except AttributeError:
                 game_item.old_updated = None
-                
+
             skipfile_skip = check_skip_file(game_item.name, skipfiles)
             if skipfile_skip:
                 info('     skip       %s (matches "%s")' % (game_item.name, skipfile_skip))
@@ -3124,19 +3150,19 @@ def cmd_download(savedir, skipextras,skipids, dryrun, ids,os_list, lang_list,ski
                 warn('     unknown    %s has no size info.  skipping' % game_item.name)
                 continue
 
-            if os.path.isfile(provisional_file):
-                if os.path.isfile(dest_file):
-                    #I don't know how you got it here, but if you did , clean up your mess! This is not my problem. But more politely. 
+            if game_item.name in provisional_dir_sizes:
+                if game_item.name in dest_dir_sizes:
+                    #I don't know how you got it here, but if you did , clean up your mess! This is not my problem. But more politely.
                     warn('     error      %s has both provisional and destination file. Please remove one.' % game_item.name)
                     continue
                 else:
                     info('     working    %s' % game_item.name)
                     provisional_dict[dest_file] = (dest_file,provisional_file,game_item,all_items)
                     continue
-                    
-                
-            if os.path.isfile(dest_file):
-                if game_item.size != os.path.getsize(dest_file):
+
+
+            if game_item.name in dest_dir_sizes:
+                if game_item.size != dest_dir_sizes[game_item.name]:
                     warn('     fail       %s has incorrect size.' % game_item.name)
                 elif game_item.force_change == True:
                     warn('     fail       %s has been marked for change.' % game_item.name)
