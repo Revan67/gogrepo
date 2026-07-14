@@ -1,3 +1,41 @@
+# gogrepoc (personal fork)
+
+This is a personal fork of `gogrepoc.py`, a GOG.com library backup/update/verify
+tool, used here to manage a real library of roughly 2,650 games.
+
+**Performance work on the CLI engine** (`gogrepoc.py`) — faster manifest
+load/save via a JSON manifest format (migrated automatically and
+non-destructively from the original pickle-based `.dat` manifest), threaded
+per-game metadata fetch during `update`, a rewritten download I/O loop that
+avoids a per-chunk thread spawn, faster MD5 hashing, and a scandir-based
+rewrite of `download`'s pre-scan step that measured ~2x faster against the
+real library (375s -> 180s, controlled A/B). None of this changes CLI
+behavior, flags, or output — each step was verified with differential
+testing against the original script. See the commit history for the
+specifics of each change.
+
+## Verified performance gains
+
+Two results, both against the real library (~2,650 games, ~15.4TB):
+
+- **Download pre-scan**: 375s -> 180s (~2x). A controlled A/B comparison —
+  same manifest, same library state, only the scandir change toggled.
+- **Full verify run**: ~21.8 hours of actual verification work across three
+  interrupted attempts, cross-checked against an independent ~29-hour
+  extrapolation from mid-run progress — both well under the "several days"
+  it used to take with the old script. This is an observed real-world
+  result rather than a clean A/B (the run was interrupted several times,
+  and multiple changes above all landed together), but it's a large,
+  honest improvement.
+
+---
+
+## Original upstream README
+
+The following is the original project's README, unmodified.
+
+---
+
 # **The fix for the rare manifest destruction defenct has now been merged to main. I recommend updating at your earliest conveniece. - Dated: 8 July 2026** 
 # **With the official release of the fix, I am now getting some reports of the manifest being unable to be read ( non-destructively ). I am looking into this, if you experience this please contact me on the GOG thread or file an Issue ( I will probably need your manifest ). This is definitely better than it being destructively read, so I still recommend updating. I'll provide a fix for this issue ASAP.** 
 # **Have hopefully isolated this now and it's currently being tested.** 
