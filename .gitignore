@@ -1,0 +1,30 @@
+.idea
+*.yml
+*.pyc
+*.bat
+*.dat
+*.log
+*.html
+*.dump
+*.tmp
+*.bak
+*.log.*
+cookies
+cookies*
+cookies.*
+cookies*.*
+*cookies*
+*cookies*.*
+
+# GUI/session-local state and bulk data (not source)
+__pycache__/
+gog-manifest.json
+gog-manifest.json.bak
+gogrepo_gui_settings.json
+
+# explicit safety net for the auth token, even though *.dat covers it
+gog-token.dat
+
+# GUI app and its backend fork stay untracked (CLI-only repo)
+gogrepo_gui.py
+gogrepoc_backend.py
